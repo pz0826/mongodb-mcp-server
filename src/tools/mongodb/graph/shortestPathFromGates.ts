@@ -333,8 +333,27 @@ export class ShortestPathFromGatesTool extends MongoDBToolBase {
             const startGates = (startRoad?.gate || []) as Gate[];
             const endGates = (endRoad?.gate || []) as Gate[];
 
-            const startGate = startGates.find((g) => this.convertLongToNumber(g.aoi_id) === startAOIId);
-            const endGate = endGates.find((g) => this.convertLongToNumber(g.aoi_id) === endAOIId);
+            // 优先查找与travelMode匹配的gate
+            // 如果是walking模式，driving类型的gate也可以使用（能开车的地方一定能走路）
+            let startGate = startGates.find(
+                (g) => this.convertLongToNumber(g.aoi_id) === startAOIId && g.type === travelMode
+            );
+            // 如果没找到完全匹配的，且是walking模式，则查找driving类型的gate
+            if (!startGate && travelMode === "walking") {
+                startGate = startGates.find(
+                    (g) => this.convertLongToNumber(g.aoi_id) === startAOIId && g.type === "driving"
+                );
+            }
+
+            let endGate = endGates.find(
+                (g) => this.convertLongToNumber(g.aoi_id) === endAOIId && g.type === travelMode
+            );
+            // 如果没找到完全匹配的，且是walking模式，则查找driving类型的gate
+            if (!endGate && travelMode === "walking") {
+                endGate = endGates.find(
+                    (g) => this.convertLongToNumber(g.aoi_id) === endAOIId && g.type === "driving"
+                );
+            }
 
             if (!startGate) {
                 return {
@@ -360,29 +379,12 @@ export class ShortestPathFromGatesTool extends MongoDBToolBase {
                 };
             }
 
-            if (startGate.type !== travelMode) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `错误：起点gate的通行类型为 '${startGate.type}'，与请求的 '${travelMode}' 不匹配`,
-                        },
-                    ],
-                    isError: true,
-                };
-            }
-
-            if (endGate.type !== travelMode) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `错误：终点gate的通行类型为 '${endGate.type}'，与请求的 '${travelMode}' 不匹配`,
-                        },
-                    ],
-                    isError: true,
-                };
-            }
+            // gate查找逻辑已经确保了类型兼容性，这里只需要记录实际使用的gate类型
+            this.session.logger.info({
+                id: LogId.shortestPathStart,
+                context: "shortestPathFromGates",
+                message: `使用起点gate类型: ${startGate.type}, 终点gate类型: ${endGate.type}`,
+            });
 
             // 获取所有道路（根据通行类型过滤）
             const excludedCategories = travelMode === "driving" ? ["footway", "cycleway", "steps"] : [];
@@ -421,11 +423,31 @@ export class ShortestPathFromGatesTool extends MongoDBToolBase {
                 message: `加载了 ${allRoads.length} 条道路（通行类型: ${travelMode}）`,
             });
 
+            // 查询所有具有相同gate坐标的道路（双向道路）
+            // 这样可以确保无论用户选择哪个方向的道路，结果都一致
+            const startGateRoads = await this.findRoadsWithSameGate(
+                provider,
+                database,
+                collection,
+                startGate.coordinates,
+                startAOIId
+            );
+            
+            const endGateRoads = await this.findRoadsWithSameGate(
+                provider,
+                database,
+                collection,
+                endGate.coordinates,
+                endAOIId
+            );
+
             // 处理起点和终点道路的裁剪
             const processedRoads = this.splitRoadsAtGates(
                 allRoads,
                 startRoad!,
                 endRoad!,
+                startGateRoads,
+                endGateRoads,
                 startGate,
                 endGate,
                 travelMode
@@ -537,12 +559,69 @@ export class ShortestPathFromGatesTool extends MongoDBToolBase {
     }
 
     /**
+     * 检查两个坐标是否相同（考虑浮点精度）
+     */
+    private coordinatesEqual(coord1: number[], coord2: number[], tolerance: number = 0.00001): boolean {
+        if (coord1.length !== coord2.length) return false;
+        return this.calculateDistance(coord1, coord2) < tolerance;
+    }
+
+    /**
+     * 查询所有具有相同gate坐标的道路（用于处理双向道路）
+     */
+    private async findRoadsWithSameGate(
+        provider: any,
+        database: string,
+        collection: string,
+        gateCoordinates: number[],
+        aoiId: number
+    ): Promise<any[]> {
+        // 构建查询条件：gate数组中至少有一个元素的aoi_id和coordinates都匹配
+        const tolerance = 0.00001; // 坐标容差（约1米）
+        
+        const roads = await provider
+            .aggregate(database, collection, [
+                {
+                    $match: {
+                        "gate.aoi_id": aoiId,
+                    },
+                },
+                {
+                    $project: {
+                        _id: 0,
+                        id: 1,
+                        from_junction: 1,
+                        to_junction: 1,
+                        length: 1,
+                        name: 1,
+                        catg: 1,
+                        max_speed: 1,
+                        gate: 1,
+                        geometry: 1,
+                    },
+                },
+            ])
+            .toArray();
+
+        // 在内存中过滤：检查gate坐标是否匹配
+        return roads.filter((road: any) => {
+            const gates = (road.gate || []) as Gate[];
+            return gates.some((gate: Gate) => {
+                if (this.convertLongToNumber(gate.aoi_id) !== aoiId) return false;
+                return this.coordinatesEqual(gate.coordinates, gateCoordinates, tolerance);
+            });
+        });
+    }
+
+    /**
      * 在gate处分割道路，并添加剩余道路，得到用于指定起始点和终点的道路列表
      */
     private splitRoadsAtGates(
         allRoads: any[],
         startRoad: any,
         endRoad: any,
+        startGateRoads: any[],
+        endGateRoads: any[],
         startGate: Gate,
         endGate: Gate,
         travelMode: "driving" | "walking"
@@ -554,8 +633,11 @@ export class ShortestPathFromGatesTool extends MongoDBToolBase {
         const roads: RoadEdge[] = [];
         let startJunction: number;
         let endJunction: number;
+        
+        // 用于跟踪哪些道路已被处理（避免重复处理双向道路）
+        const processedRoadIds = new Set<number>();
 
-        // 处理起点道路
+        // 处理起点道路（包含所有具有相同gate坐标的双向道路）
         const startRoadCoords = startRoad.geometry?.coordinates || [];
         const isStartGateAtEndpoint = this.isGateAtEndpoint(startGate.coordinates, startRoadCoords);
 
@@ -569,64 +651,85 @@ export class ShortestPathFromGatesTool extends MongoDBToolBase {
 
             startJunction = distToFrom < distToTo ? fromJunc : toJunc;
 
-            const roadLength = Number(startRoad.length);
-            const maxSpeed = Number(startRoad.max_speed);
+            // 处理所有具有相同gate坐标的道路（双向道路）
+            for (const road of startGateRoads) {
+                const roadId = this.convertLongToNumber(road.id);
+                const roadLength = Number(road.length);
+                const maxSpeed = Number(road.max_speed);
+                const roadFromJunc = this.convertLongToNumber(road.from_junction);
+                const roadToJunc = this.convertLongToNumber(road.to_junction);
 
-            roads.push({
-                id: this.convertLongToNumber(startRoad.id),
-                from_junction: fromJunc,
-                to_junction: toJunc,
-                length: roadLength,
-                cost: this.calculateRoadCost(roadLength, maxSpeed, travelMode),
-                name: startRoad.name,
-                catg: startRoad.catg,
-                max_speed: maxSpeed,
-            });
+                roads.push({
+                    id: roadId,
+                    from_junction: roadFromJunc,
+                    to_junction: roadToJunc,
+                    length: roadLength,
+                    cost: this.calculateRoadCost(roadLength, maxSpeed, travelMode),
+                    name: road.name,
+                    catg: road.catg,
+                    max_speed: maxSpeed,
+                });
+                
+                processedRoadIds.add(roadId);
+            }
         } else {
             // Gate不在端点，需要分割
+            // 所有具有相同gate坐标的道路使用同一个新junction
             startJunction = ShortestPathFromGatesTool.GATE_JUNCTION_ID_START + this.gateJunctionCounter++;
 
-            const originalLength = Number(startRoad.length);
-            const maxSpeed = Number(startRoad.max_speed);
-            const fromJunc = this.convertLongToNumber(startRoad.from_junction);
-            const toJunc = this.convertLongToNumber(startRoad.to_junction);
+            // 处理所有具有相同gate坐标的道路（双向道路）
+            for (const road of startGateRoads) {
+                const roadId = this.convertLongToNumber(road.id);
+                const roadCoords = road.geometry?.coordinates || [];
+                const originalLength = Number(road.length);
+                const maxSpeed = Number(road.max_speed);
+                const fromJunc = this.convertLongToNumber(road.from_junction);
+                const toJunc = this.convertLongToNumber(road.to_junction);
 
-            // 计算gate到两个端点的距离比例
-            const distToFrom = this.calculateDistance(startGate.coordinates, startRoadCoords[0]);
-            const distToTo = this.calculateDistance(startGate.coordinates, startRoadCoords[startRoadCoords.length - 1]);
-            const totalDist = distToFrom + distToTo;
+                // 找到这条道路上对应的gate坐标
+                const gates = (road.gate || []) as Gate[];
+                const matchingGate = gates.find((g: Gate) => this.coordinatesEqual(g.coordinates, startGate.coordinates));
+                if (!matchingGate) continue;
 
-            const ratioToFrom = distToFrom / totalDist;
-            const ratioToTo = distToTo / totalDist;
+                // 计算gate到两个端点的距离比例
+                const distToFrom = this.calculateDistance(matchingGate.coordinates, roadCoords[0]);
+                const distToTo = this.calculateDistance(matchingGate.coordinates, roadCoords[roadCoords.length - 1]);
+                const totalDist = distToFrom + distToTo;
 
-            const lengthToFrom = originalLength * ratioToFrom;
-            const lengthToTo = originalLength * ratioToTo;
+                const ratioToFrom = distToFrom / totalDist;
+                const ratioToTo = distToTo / totalDist;
 
-            // 分割为两段（共享原始道路的 geometry）
-            roads.push({
-                id: this.convertLongToNumber(startRoad.id) + 10000000000, // 使用偏移避免ID冲突
-                from_junction: fromJunc,
-                to_junction: startJunction,
-                length: lengthToFrom,
-                cost: this.calculateRoadCost(lengthToFrom, maxSpeed, travelMode),
-                name: startRoad.name,
-                catg: startRoad.catg,
-                max_speed: maxSpeed,
-            });
+                const lengthToFrom = originalLength * ratioToFrom;
+                const lengthToTo = originalLength * ratioToTo;
 
-            roads.push({
-                id: this.convertLongToNumber(startRoad.id) + 20000000000,
-                from_junction: startJunction,
-                to_junction: toJunc,
-                length: lengthToTo,
-                cost: this.calculateRoadCost(lengthToTo, maxSpeed, travelMode),
-                name: startRoad.name,
-                catg: startRoad.catg,
-                max_speed: maxSpeed,
-            });
+                // 分割为两段
+                roads.push({
+                    id: roadId + 10000000000,
+                    from_junction: fromJunc,
+                    to_junction: startJunction,
+                    length: lengthToFrom,
+                    cost: this.calculateRoadCost(lengthToFrom, maxSpeed, travelMode),
+                    name: road.name,
+                    catg: road.catg,
+                    max_speed: maxSpeed,
+                });
+
+                roads.push({
+                    id: roadId + 20000000000,
+                    from_junction: startJunction,
+                    to_junction: toJunc,
+                    length: lengthToTo,
+                    cost: this.calculateRoadCost(lengthToTo, maxSpeed, travelMode),
+                    name: road.name,
+                    catg: road.catg,
+                    max_speed: maxSpeed,
+                });
+                
+                processedRoadIds.add(roadId);
+            }
         }
 
-        // 处理终点道路
+        // 处理终点道路（包含所有具有相同gate坐标的双向道路）
         const endRoadCoords = endRoad.geometry?.coordinates || [];
         const isEndGateAtEndpoint = this.isGateAtEndpoint(endGate.coordinates, endRoadCoords);
 
@@ -639,71 +742,95 @@ export class ShortestPathFromGatesTool extends MongoDBToolBase {
 
             endJunction = distToFrom < distToTo ? fromJunc : toJunc;
 
-            // 避免重复添加（如果起点和终点是同一条道路）
-            if (this.convertLongToNumber(endRoad.id) !== this.convertLongToNumber(startRoad.id)) {
-                const roadLength = Number(endRoad.length);
-                const maxSpeed = Number(endRoad.max_speed);
+            // 处理所有具有相同gate坐标的道路（双向道路）
+            for (const road of endGateRoads) {
+                const roadId = this.convertLongToNumber(road.id);
+                
+                // 避免重复添加已处理的道路
+                if (processedRoadIds.has(roadId)) continue;
+
+                const roadLength = Number(road.length);
+                const maxSpeed = Number(road.max_speed);
+                const roadFromJunc = this.convertLongToNumber(road.from_junction);
+                const roadToJunc = this.convertLongToNumber(road.to_junction);
 
                 roads.push({
-                    id: this.convertLongToNumber(endRoad.id),
-                    from_junction: fromJunc,
-                    to_junction: toJunc,
+                    id: roadId,
+                    from_junction: roadFromJunc,
+                    to_junction: roadToJunc,
                     length: roadLength,
                     cost: this.calculateRoadCost(roadLength, maxSpeed, travelMode),
-                    name: endRoad.name,
-                    catg: endRoad.catg,
+                    name: road.name,
+                    catg: road.catg,
                     max_speed: maxSpeed,
                 });
+                
+                processedRoadIds.add(roadId);
             }
         } else {
             endJunction = ShortestPathFromGatesTool.GATE_JUNCTION_ID_START + this.gateJunctionCounter++;
 
-            const originalLength = Number(endRoad.length);
-            const maxSpeed = Number(endRoad.max_speed);
-            const fromJunc = this.convertLongToNumber(endRoad.from_junction);
-            const toJunc = this.convertLongToNumber(endRoad.to_junction);
+            // 处理所有具有相同gate坐标的道路（双向道路）
+            for (const road of endGateRoads) {
+                const roadId = this.convertLongToNumber(road.id);
+                
+                // 避免重复添加已处理的道路
+                if (processedRoadIds.has(roadId)) continue;
 
-            const distToFrom = this.calculateDistance(endGate.coordinates, endRoadCoords[0]);
-            const distToTo = this.calculateDistance(endGate.coordinates, endRoadCoords[endRoadCoords.length - 1]);
-            const totalDist = distToFrom + distToTo;
+                const roadCoords = road.geometry?.coordinates || [];
+                const originalLength = Number(road.length);
+                const maxSpeed = Number(road.max_speed);
+                const fromJunc = this.convertLongToNumber(road.from_junction);
+                const toJunc = this.convertLongToNumber(road.to_junction);
 
-            const ratioToFrom = distToFrom / totalDist;
-            const ratioToTo = distToTo / totalDist;
+                // 找到这条道路上对应的gate坐标
+                const gates = (road.gate || []) as Gate[];
+                const matchingGate = gates.find((g: Gate) => this.coordinatesEqual(g.coordinates, endGate.coordinates));
+                if (!matchingGate) continue;
 
-            const lengthToFrom = originalLength * ratioToFrom;
-            const lengthToTo = originalLength * ratioToTo;
+                // 计算gate到两个端点的距离比例
+                const distToFrom = this.calculateDistance(matchingGate.coordinates, roadCoords[0]);
+                const distToTo = this.calculateDistance(matchingGate.coordinates, roadCoords[roadCoords.length - 1]);
+                const totalDist = distToFrom + distToTo;
 
-            roads.push({
-                id: this.convertLongToNumber(endRoad.id) + 10000000000,
-                from_junction: fromJunc,
-                to_junction: endJunction,
-                length: lengthToFrom,
-                cost: this.calculateRoadCost(lengthToFrom, maxSpeed, travelMode),
-                name: endRoad.name,
-                catg: endRoad.catg,
-                max_speed: maxSpeed,
-            });
+                const ratioToFrom = distToFrom / totalDist;
+                const ratioToTo = distToTo / totalDist;
 
-            roads.push({
-                id: this.convertLongToNumber(endRoad.id) + 20000000000,
-                from_junction: endJunction,
-                to_junction: toJunc,
-                length: lengthToTo,
-                cost: this.calculateRoadCost(lengthToTo, maxSpeed, travelMode),
-                name: endRoad.name,
-                catg: endRoad.catg,
-                max_speed: maxSpeed,
-            });
+                const lengthToFrom = originalLength * ratioToFrom;
+                const lengthToTo = originalLength * ratioToTo;
+
+                roads.push({
+                    id: roadId + 10000000000,
+                    from_junction: fromJunc,
+                    to_junction: endJunction,
+                    length: lengthToFrom,
+                    cost: this.calculateRoadCost(lengthToFrom, maxSpeed, travelMode),
+                    name: road.name,
+                    catg: road.catg,
+                    max_speed: maxSpeed,
+                });
+
+                roads.push({
+                    id: roadId + 20000000000,
+                    from_junction: endJunction,
+                    to_junction: toJunc,
+                    length: lengthToTo,
+                    cost: this.calculateRoadCost(lengthToTo, maxSpeed, travelMode),
+                    name: road.name,
+                    catg: road.catg,
+                    max_speed: maxSpeed,
+                });
+                
+                processedRoadIds.add(roadId);
+            }
         }
 
         // 添加其他所有道路
         for (const road of allRoads) {
             const roadId = this.convertLongToNumber(road.id);
-            const startId = this.convertLongToNumber(startRoad.id);
-            const endId = this.convertLongToNumber(endRoad.id);
 
-            // 跳过已处理的起点和终点道路
-            if (roadId === startId || roadId === endId) continue;
+            // 跳过已处理的道路（包括起点、终点及其双向道路）
+            if (processedRoadIds.has(roadId)) continue;
 
             const roadLength = Number(road.length);
             const maxSpeed = Number(road.max_speed);
