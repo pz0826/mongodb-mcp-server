@@ -161,15 +161,15 @@ if [ "$TRANSPORT_TYPE" = "http" ]; then
 fi
 
 # 从配置文件读取设置
-CONFIG_FILE="$SCRIPT_DIR/config.json"
+CONFIG_FILE="$SCRIPT_DIR/../config.json"
 
 if [ -f "$CONFIG_FILE" ]; then
     echo -e "${YELLOW}📄 从配置文件加载设置: $CONFIG_FILE${NC}"
     
     # 使用 jq 读取配置（如果没有安装，使用默认值）
     if command -v jq &> /dev/null; then
-        export MDB_MCP_CONNECTION_STRING=$(jq -r '.mongodb.connection_string' "$CONFIG_FILE")
-        export MDB_MCP_READ_ONLY=$(jq -r '.mongodb.read_only' "$CONFIG_FILE")
+        export MDB_MCP_CONNECTION_STRING=$(jq -r '.mongodb_server.connection_string' "$CONFIG_FILE")
+        export MDB_MCP_READ_ONLY=$(jq -r '.mongodb_server.read_only' "$CONFIG_FILE")
         export MDB_MCP_LOGGERS=$(jq -r '.logging.loggers' "$CONFIG_FILE")
         echo -e "${GREEN}✓ 配置加载成功${NC}"
     else
